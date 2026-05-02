@@ -1,88 +1,122 @@
 #!/bin/bash
 
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+# 颜色定义
+RED='\033[031m'
+GREEN='\033[032m'
+YELLOW='\033[033m'
+PLAIN='\033[0m'
 
-echo -e "${BLUE}======================================${NC}"
-echo -e "${GREEN}    TUIC v5 交互式自动化部署脚本${NC}"
-echo -e "${BLUE}======================================${NC}"
+[[ $EUID -ne 0 ]] && echo -e "${RED}错误：${PLAIN} 必须使用 root 用户运行！\n" && exit 1
 
-# 1. 交互输入域名
-read -p "请输入解析到此服务器的域名 (例如 jp.aititilook.cc): " DOMAIN
-if [ -z "$DOMAIN" ]; then
-    echo -e "${YELLOW}错误: 域名不能为空。${NC}"
-    exit 1
+# 1. 交互式输入
+read -p "请输入你的域名 (确保已解析到此服务器 IP): " domain
+read -p "请输入你的 UUID (回车随机生成): " uuid
+[[ -z "$uuid" ]] && uuid=$(cat /proc/sys/kernel/random/uuid)
+read -p "请输入你的密码 (回车随机生成): " password
+[[ -z "$password" ]] && password=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 12)
+read -p "请输入主监听端口 (默认 8443): " main_port
+[[ -z "$main_port" ]] && main_port=8443
+read -p "请输入端口跳跃范围 (例如 20000-30000, 留空不开启): " port_range
+
+# 2. 安装基础组件与 acme.sh
+apt update && apt install -y curl wget tar jq openssl cron socat
+curl https://get.acme.sh | sh
+~/.acme.sh/acme.sh --upgrade --auto-upgrade
+~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+
+# 3. 申请证书
+mkdir -p /etc/sing-box/cert
+~/.acme.sh/acme.sh --issue -d $domain --standalone
+~/.acme.sh/acme.sh --install-cert -d $domain \
+    --key-file /etc/sing-box/cert/private.key \
+    --fullchain-file /etc/sing-box/cert/fullchain.crt
+
+# 4. 下载并安装 sing-box
+# 自动获取最新 amd64 版本[span_1](start_span)[span_1](end_span)
+SB_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
+wget "https://github.com/SagerNet/sing-box/releases/download/${SB_VERSION}/sing-box-${SB_VERSION#v}-linux-amd64.tar.gz" -O sb.tar.gz
+tar -zxvf sb.tar.gz
+cp sing-box-*/sing-box /usr/local/bin/
+rm -rf sb.tar.gz sing-box-*
+
+# 5. 配置端口跳跃 (iptables)
+if [[ -n "$port_range" ]]; then
+    iptables -t nat -A PREROUTING -p udp --dport $port_range -j REDIRECT --to-ports $main_port
+    ip6tables -t nat -A PREROUTING -p udp --dport $port_range -j REDIRECT --to-ports $main_port
+    # 保存规则 (Debian)
+    apt install -y iptables-persistent
+    netfilter-persistent save
 fi
 
-# 2. 申请证书
-echo -e "${BLUE}正在申请证书...${NC}"
-apt update && apt install -y curl wget socat iptables-persistent
-curl https://get.acme.sh | sh -s email="admin@$DOMAIN"
-source ~/.bashrc
-~/.acme.sh/acme.sh --issue -d $DOMAIN --standalone
-
-if [ $? -eq 0 ]; then
-    mkdir -p /etc/tuic/
-    ~/.acme.sh/acme.sh --install-cert -d $DOMAIN --key-file /etc/tuic/server.key --fullchain-file /etc/tuic/server.crt
-else
-    echo -e "${YELLOW}证书申请失败。${NC}"
-    exit 1
-fi
-
-# 3. 端口跳跃
-read -p "起始端口 (默认 20000): " HOP_START
-HOP_START=${HOP_START:-20000}
-read -p "结束端口 (默认 30000): " HOP_END
-HOP_END=${HOP_END:-30000}
-LISTEN_PORT=25620
-
-iptables -t nat -A PREROUTING -p udp --dport $HOP_START:$HOP_END -j REDIRECT --to-ports $LISTEN_PORT
-ip6tables -t nat -A PREROUTING -p udp --dport $HOP_START:$HOP_END -j REDIRECT --to-ports $LISTEN_PORT
-netfilter-persistent save
-
-# 4. 安装服务端 (这里我直接写死链接，不使用变量，防止 404)
-echo -e "${BLUE}正在安装 TUIC 服务端...${NC}"
-UUID=$(cat /proc/sys/kernel/random/uuid)
-PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 12)
-
-# 直接下载 v1.0.0 正式版，确保链接 100% 有效
-wget -O /usr/local/bin/tuic-server https://github.com/EAimTY/tuic/releases/download/1.0.0/tuic-server-1.0.0-x86_64-unknown-linux-gnu
-
-chmod +x /usr/local/bin/tuic-server
-
-cat > /etc/tuic/config.json <<EOF
+# 6. 生成服务端 config.json[span_2](start_span)[span_2](end_span)
+cat <<EOF > /etc/sing-box/config.json
 {
-    "server": "[::]:$LISTEN_PORT",
-    "users": { "$UUID": "$PASSWORD" },
-    "certificate": "/etc/tuic/server.crt",
-    "private_key": "/etc/tuic/server.key",
-    "congestion_control": "bbr",
-    "alpn": ["h3"]
+  "log": { "level": "info" },
+  "inbounds": [
+    {
+      "type": "tuic",
+      "tag": "tuic-in",
+      "listen": "::",
+      "listen_port": $main_port,
+      "users": [ { "uuid": "$uuid", "password": "$password" } ],
+      "tls": {
+        "enabled": true,
+        "server_name": "$domain",
+        "certificate_path": "/etc/sing-box/cert/fullchain.crt",
+        "key_path": "/etc/sing-box/cert/private.key",
+        "alpn": ["h3"]
+      },
+      "congestion_control": "bbr"
+    }
+  ]
 }
 EOF
 
-# 5. 启动服务
-cat > /etc/systemd/system/tuic.service <<EOF
+# 7. 启动服务
+systemctl stop sing-box 2>/dev/null
+cat <<EOF > /etc/systemd/system/sing-box.service
 [Unit]
-Description=TUIC v5 Service
-After=network.target
+Description=sing-box Service
+After=network.target nss-lookup.target
+
 [Service]
-ExecStart=/usr/local/bin/tuic-server -c /etc/tuic/config.json
+User=root
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
 Restart=on-failure
+RestartSec=10
+LimitNOFILE=infinity
+
 [Install]
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload && systemctl enable --now tuic
-echo -e "${GREEN}TUIC 服务启动成功！${NC}"
+systemctl daemon-reload
+systemctl enable sing-box
+systemctl start sing-box
 
-# 6. 生成链接
-echo -e "${BLUE}======================================${NC}"
-echo -e "域名: $DOMAIN"
-echo -e "端口: $LISTEN_PORT,$HOP_START-$HOP_END"
-echo -e "UUID: $UUID"
-echo -e "密码: $PASSWORD"
-echo -e "${YELLOW}链接：tuic://$UUID:$PASSWORD@$DOMAIN:$LISTEN_PORT?congestion_control=bbr&alpn=h3#AWS-Node${NC}"
-echo -e "${BLUE}======================================${NC}"
+# 8. 生成客户端导入配置
+echo -e "\n${GREEN}--- 服务端部署完成 ---${PLAIN}"
+echo -e "${YELLOW}客户端 (sing-box) 配置内容：${PLAIN}"
+cat <<EOF
+{
+  "outbounds": [
+    {
+      "type": "tuic",
+      "tag": "tuic-out",
+      "server": "$domain",
+      "server_port": $main_port,
+      "uuid": "$uuid",
+      "password": "$password",
+      "tls": {
+        "enabled": true,
+        "server_name": "$domain",
+        "alpn": ["h3"]
+      },
+      "congestion_control": "bbr",
+      "udp_relay_mode": "quic",
+      "hop_interval": "30s"
+    }
+  ]
+}
+EOF
+[[ -n "$port_range" ]] && echo -e "${RED}注意：请在客户端 server_port 处修改或开启端口跳跃配置${PLAIN}"
