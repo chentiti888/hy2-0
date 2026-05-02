@@ -54,19 +54,26 @@ ip6tables -t nat -A PREROUTING -p udp --dport $HOP_START:$HOP_END -j REDIRECT --
 netfilter-persistent save
 echo -e "${GREEN}端口跳跃配置成功！范围: $HOP_START-$HOP_END${NC}"
 
-# 4. 安装服务端 (此处已修复 404 错误)
+# 4. 安装服务端 (彻底修复 404 逻辑)
 echo -e "${BLUE}正在拉取并安装 TUIC v5 最新服务端...${NC}"
 UUID=$(cat /proc/sys/kernel/random/uuid)
 PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 12)
 ARCH=$(uname -m)
 
-# --- 核心修复位置 第 46 行 ---
-[ "$ARCH" = "x86_64" ] && BIN_ARCH="x86_64-unknown-linux-gnu" || BIN_ARCH="aarch64-unknown-linux-gnu"
+# 判定架构后缀
+if [ "$ARCH" = "x86_64" ]; then
+    BIN_ARCH="x86_64-unknown-linux-gnu"
+elif [ "$ARCH" = "aarch64" ]; then
+    BIN_ARCH="aarch64-unknown-linux-gnu"
+else
+    BIN_ARCH="x86_64-unknown-linux-gnu"
+fi
 
+# 获取最新版本号并清理变量
 TUIC_VER=$(curl -s https://api.github.com/repos/EAimTY/tuic/releases/latest | grep tag_name | cut -d '"' -f 4)
 
-# --- 核心修复位置 第 48 行 ---
-wget -O /usr/local/bin/tuic-server https://github.com/EAimTY/tuic/releases/download/$TUIC_VER/tuic-server-$TUIC_VER-$BIN_ARCH
+# 核心下载命令：直接写死仓库路径，防止变量拼接错误产生双斜杠
+wget -O /usr/local/bin/tuic-server "https://github.com/EAimTY/tuic/releases/download/${TUIC_VER}/tuic-server-${TUIC_VER}-${BIN_ARCH}"
 
 chmod +x /usr/local/bin/tuic-server
 
