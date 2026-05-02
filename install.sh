@@ -1,54 +1,46 @@
 #!/bin/bash
 
 # 颜色定义
-RED='\033[031m'
-GREEN='\033[032m'
-YELLOW='\033[033m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
 PLAIN='\033[0m'
 
-[[ $EUID -ne 0 ]] && echo -e "${RED}错误：${PLAIN} 必须使用 root 用户运行！\n" && exit 1
+echo -e "${GREEN}=== TUIC v5 + sing-box 一键部署脚本 ===${PLAIN}"
 
-# 1. 交互式输入
-read -p "请输入你的域名 (确保已解析到此服务器 IP): " domain
-read -p "请输入你的 UUID (回车随机生成): " uuid
-[[ -z "$uuid" ]] && uuid=$(cat /proc/sys/kernel/random/uuid)
-read -p "请输入你的密码 (回车随机生成): " password
-[[ -z "$password" ]] && password=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 12)
-read -p "请输入主监听端口 (默认 8443): " main_port
-[[ -z "$main_port" ]] && main_port=8443
-read -p "请输入端口跳跃范围 (例如 20000-30000, 留空不开启): " port_range
+# 1. 基础环境安装
+apt update && apt install -y curl wget jq cron socat
 
-# 2. 安装基础组件与 acme.sh
-apt update && apt install -y curl wget tar jq openssl cron socat
+# 2. 获取用户输入
+read -p "请输入解析到此服务器的域名: " DOMAIN
+read -p "请设置 UUID (直接回车随机生成): " UUID
+[[ -z "$UUID" ]] && UUID=$(cat /proc/sys/kernel/random/uuid)
+read -p "请设置密码 (直接回车随机生成): " PASSWORD
+[[ -z "$PASSWORD" ]] && PASSWORD=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 12)
+read -p "请输入主端口 (默认 443): " PORT
+PORT=${PORT:-443}
+read -p "请输入端口跳跃范围 (例如 20000-30000): " HOP_RANGE
+
+# 3. 申请证书 (Acme.sh)
+echo -e "${YELLOW}正在申请证书...${PLAIN}"
 curl https://get.acme.sh | sh
 ~/.acme.sh/acme.sh --upgrade --auto-upgrade
 ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+~/.acme.sh/acme.sh --issue -d $DOMAIN --standalone
+~/.acme.sh/acme.sh --install-cert -d $DOMAIN \
+    --key-file /etc/sing-box/cert.key \
+    --fullchain-file /etc/sing-box/cert.pem
 
-# 3. 申请证书
-mkdir -p /etc/sing-box/cert
-~/.acme.sh/acme.sh --issue -d $domain --standalone
-~/.acme.sh/acme.sh --install-cert -d $domain \
-    --key-file /etc/sing-box/cert/private.key \
-    --fullchain-file /etc/sing-box/cert/fullchain.crt
-
-# 4. 下载并安装 sing-box
-# 自动获取最新 amd64 版本[span_1](start_span)[span_1](end_span)
-SB_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
-wget "https://github.com/SagerNet/sing-box/releases/download/${SB_VERSION}/sing-box-${SB_VERSION#v}-linux-amd64.tar.gz" -O sb.tar.gz
-tar -zxvf sb.tar.gz
-cp sing-box-*/sing-box /usr/local/bin/
-rm -rf sb.tar.gz sing-box-*
+# 4. 安装 sing-box
+bash <(curl -Ls https://raw.githubusercontent.com/SagerNet/sing-box/main/install.sh)
 
 # 5. 配置端口跳跃 (iptables)
-if [[ -n "$port_range" ]]; then
-    iptables -t nat -A PREROUTING -p udp --dport $port_range -j REDIRECT --to-ports $main_port
-    ip6tables -t nat -A PREROUTING -p udp --dport $port_range -j REDIRECT --to-ports $main_port
-    # 保存规则 (Debian)
-    apt install -y iptables-persistent
-    netfilter-persistent save
-fi
+echo -e "${YELLOW}配置端口跳跃规则...${PLAIN}"
+IFS='-' read -r START_PORT END_PORT <<< "$HOP_RANGE"
+iptables -t nat -A PREROUTING -p udp --dport $HOP_RANGE -j REDIRECT --to-ports $PORT
+ip6tables -t nat -A PREROUTING -p udp --dport $HOP_RANGE -j REDIRECT --to-ports $PORT
 
-# 6. 生成服务端 config.json[span_2](start_span)[span_2](end_span)
+# 6. 生成 sing-box 配置文件
 cat <<EOF > /etc/sing-box/config.json
 {
   "log": { "level": "info" },
@@ -57,66 +49,34 @@ cat <<EOF > /etc/sing-box/config.json
       "type": "tuic",
       "tag": "tuic-in",
       "listen": "::",
-      "listen_port": $main_port,
-      "users": [ { "uuid": "$uuid", "password": "$password" } ],
+      "listen_port": $PORT,
+      "users": [ { "uuid": "$UUID", "password": "$PASSWORD" } ],
+      "congestion_control": "bbr",
       "tls": {
         "enabled": true,
-        "server_name": "$domain",
-        "certificate_path": "/etc/sing-box/cert/fullchain.crt",
-        "key_path": "/etc/sing-box/cert/private.key",
-        "alpn": ["h3"]
-      },
-      "congestion_control": "bbr"
+        "server_name": "$DOMAIN",
+        "certificate_path": "/etc/sing-box/cert.pem",
+        "key_path": "/etc/sing-box/cert.key",
+        "alpn": [ "h3" ]
+      }
     }
-  ]
+  ],
+  "outbounds": [ { "type": "direct", "tag": "direct" } ]
 }
 EOF
 
 # 7. 启动服务
-systemctl stop sing-box 2>/dev/null
-cat <<EOF > /etc/systemd/system/sing-box.service
-[Unit]
-Description=sing-box Service
-After=network.target nss-lookup.target
-
-[Service]
-User=root
-ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
-Restart=on-failure
-RestartSec=10
-LimitNOFILE=infinity
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
 systemctl enable sing-box
-systemctl start sing-box
+systemctl restart sing-box
 
-# 8. 生成客户端导入配置
-echo -e "\n${GREEN}--- 服务端部署完成 ---${PLAIN}"
-echo -e "${YELLOW}客户端 (sing-box) 配置内容：${PLAIN}"
-cat <<EOF
-{
-  "outbounds": [
-    {
-      "type": "tuic",
-      "tag": "tuic-out",
-      "server": "$domain",
-      "server_port": $main_port,
-      "uuid": "$uuid",
-      "password": "$password",
-      "tls": {
-        "enabled": true,
-        "server_name": "$domain",
-        "alpn": ["h3"]
-      },
-      "congestion_control": "bbr",
-      "udp_relay_mode": "quic",
-      "hop_interval": "30s"
-    }
-  ]
-}
-EOF
-[[ -n "$port_range" ]] && echo -e "${RED}注意：请在客户端 server_port 处修改或开启端口跳跃配置${PLAIN}"
+# 8. 生成导入链接
+# TUIC 格式: tuic://uuid:pass@domain:port?congestion_control=bbr&alpn=h3&sni=domain&udp_relay_mode=native#TUIC_singbox
+# 注意：端口跳跃在客户端需填写为 port_hooping 格式
+ENCODED_LINK="tuic://$UUID:$PASSWORD@$DOMAIN:$PORT?congestion_control=bbr&alpn=h3&sni=$DOMAIN&udp_relay_mode=native"
+HOP_LINK="tuic://$UUID:$PASSWORD@$DOMAIN:$START_PORT-$END_PORT?congestion_control=bbr&alpn=h3&sni=$DOMAIN&udp_relay_mode=native"
+
+echo -e "---"
+echo -e "${GREEN}部署完成！${PLAIN}"
+echo -e "${BLUE}主端口链接:${PLAIN} $ENCODED_LINK"
+echo -e "${BLUE}端口跳跃链接:${PLAIN} $HOP_LINK"
+echo -e "${YELLOW}提示: 部分客户端支持 20000-30000 格式的端口范围填写。${PLAIN}"
